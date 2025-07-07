@@ -1,0 +1,178 @@
+name: Docker Image Sync
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      source_image:
+        description: '源镜像地址 (例如: nginx:latest)'
+        required: true
+        default: 'nginx:latest'
+      target_name:
+        description: '目标镜像名称 (例如: my-nginx)'
+        required: true
+        default: 'nginx'
+      target_tag:
+        description: '目标镜像标签'
+        required: false
+        default: 'latest'
+  
+  # 定时触发 (每天凌晨2点)
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # 推送到main分支时触发
+  push:
+    branches: [ main ]
+    paths: [ 'images.txt' ]
+
+env:
+  # 镜像仓库配置
+  REGISTRY: registry.cn-hangzhou.aliyuncs.com  # 阿里云镜像仓库
+  NAMESPACE: your-namespace  # 替换为你的命名空间
+
+jobs:
+  sync-images:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        # 如果是定时任务，从配置文件读取镜像列表
+        # 如果是手动触发，使用输入的镜像
+        include:
+          - source: nginx:latest
+            target: nginx
+            tag: latest
+          - source: redis:7-alpine
+            target: redis
+            tag: 7-alpine
+          - source: mysql:8.0
+            target: mysql
+            tag: 8.0
+          - source: node:18-alpine
+            target: node
+            tag: 18-alpine
+          - source: python:3.11-slim
+            target: python
+            tag: 3.11-slim
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to target registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+    
+    - name: Determine image info
+      id: image_info
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "source=${{ github.event.inputs.source_image }}" >> $GITHUB_OUTPUT
+          echo "target=${{ github.event.inputs.target_name }}" >> $GITHUB_OUTPUT
+          echo "tag=${{ github.event.inputs.target_tag }}" >> $GITHUB_OUTPUT
+        else
+          echo "source=${{ matrix.source }}" >> $GITHUB_OUTPUT
+          echo "target=${{ matrix.target }}" >> $GITHUB_OUTPUT
+          echo "tag=${{ matrix.tag }}" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Pull source image
+      run: |
+        echo "拉取源镜像: ${{ steps.image_info.outputs.source }}"
+        docker pull ${{ steps.image_info.outputs.source }}
+    
+    - name: Tag and push image
+      run: |
+        SOURCE_IMAGE="${{ steps.image_info.outputs.source }}"
+        TARGET_IMAGE="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ steps.image_info.outputs.target }}:${{ steps.image_info.outputs.tag }}"
+        
+        echo "重新标记镜像: $SOURCE_IMAGE -> $TARGET_IMAGE"
+        docker tag $SOURCE_IMAGE $TARGET_IMAGE
+        
+        echo "推送镜像到仓库..."
+        docker push $TARGET_IMAGE
+        
+        echo "镜像同步完成!"
+        echo "可通过以下命令拉取: docker pull $TARGET_IMAGE"
+    
+    - name: Clean up
+      if: always()
+      run: |
+        # 清理本地镜像以节省空间
+        docker rmi ${{ steps.image_info.outputs.source }} || true
+        docker rmi ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ steps.image_info.outputs.target }}:${{ steps.image_info.outputs.tag }} || true
+        docker system prune -f
+
+  # 批量同步任务（从配置文件读取）
+  batch-sync:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && contains(github.event.head_commit.modified, 'images.txt'))
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to target registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+    
+    - name: Sync images from config file
+      run: |
+        if [ -f "images.txt" ]; then
+          echo "从配置文件批量同步镜像..."
+          while IFS= read -r line || [ -n "$line" ]; do
+            # 跳过空行和注释行
+            [[ -z "$line" || "$line" =~ ^#.*$ ]] && continue
+            
+            # 解析配置行: source_image target_name:target_tag
+            SOURCE=$(echo "$line" | awk '{print $1}')
+            TARGET_FULL=$(echo "$line" | awk '{print $2}')
+            TARGET_NAME=$(echo "$TARGET_FULL" | cut -d':' -f1)
+            TARGET_TAG=$(echo "$TARGET_FULL" | cut -d':' -f2)
+            
+            if [ -z "$TARGET_TAG" ] || [ "$TARGET_TAG" = "$TARGET_NAME" ]; then
+              TARGET_TAG="latest"
+            fi
+            
+            echo "同步: $SOURCE -> $TARGET_NAME:$TARGET_TAG"
+            
+            # 拉取源镜像
+            if docker pull "$SOURCE"; then
+              TARGET_IMAGE="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/$TARGET_NAME:$TARGET_TAG"
+              
+              # 重新标记并推送
+              docker tag "$SOURCE" "$TARGET_IMAGE"
+              docker push "$TARGET_IMAGE"
+              
+              # 清理本地镜像
+              docker rmi "$SOURCE" || true
+              docker rmi "$TARGET_IMAGE" || true
+              
+              echo "✓ 同步完成: $TARGET_IMAGE"
+            else
+              echo "✗ 拉取失败: $SOURCE"
+            fi
+            
+            echo "---"
+          done < images.txt
+        else
+          echo "未找到 images.txt 配置文件"
+        fi
+    
+    - name: Clean up
+      if: always()
+      run: |
+        docker system prune -f
