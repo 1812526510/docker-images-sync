@@ -28,8 +28,8 @@ on:
 
 env:
   # 镜像仓库配置
-  REGISTRY: registry.cn-hangzhou.aliyuncs.com  # 阿里云镜像仓库
-  NAMESPACE: your-namespace  # 替换为你的命名空间
+  REGISTRY: crpi-7m2ke9d18pv8eph7.cn-hangzhou.personal.cr.aliyuncs.com  # 阿里云镜像仓库
+  NAMESPACE: fq_project  # 替换为你的命名空间
 
 jobs:
   sync-images:
